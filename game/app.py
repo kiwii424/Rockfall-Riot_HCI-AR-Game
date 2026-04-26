@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pygame
 
+from .analytics import AnalyticsTracker, draw_radar_chart
 from .audio import SfxPlayer
 from .camera import CameraFeed, frame_to_surface
 from .config import (
@@ -167,6 +168,7 @@ class FruitNinjaARApp:
 
         self.camera = CameraFeed(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.tracker = HandTracker()
+        self.analytics = AnalyticsTracker()
         self.analysis: MusicAnalysis = default_analysis()
         self.spawner = RhythmSpawner(self.analysis.events)
         self.score = ScoreKeeper()
@@ -458,6 +460,7 @@ class FruitNinjaARApp:
 
     def _launch_new_game(self) -> None:
         self.score.reset()
+        self.analytics.reset()
         speed = self.current_fruit_speed_multiplier
         lead_time = min(SPAWN_LEAD_TIME / max(0.05, speed), GET_READY_SECONDS)
         self.spawner = RhythmSpawner(
@@ -896,6 +899,9 @@ class FruitNinjaARApp:
             SCREEN_HEIGHT,
             self.next_fruit_id,
         )
+        gate = self.analytics.spawn_gate
+        if gate < 1.0:
+            new_fruits = [f for f in new_fruits if self.rng.random() < gate]
         self.fruits.extend(new_fruits)
 
     def _update_fruits(self, dt: float) -> None:
@@ -904,6 +910,7 @@ class FruitNinjaARApp:
             fruit.update(dt)
             if fruit.is_offscreen(SCREEN_HEIGHT):
                 self.score.register_miss()
+                self.analytics.record_miss(self.game_time)
                 self._add_feedback("Miss", fruit.x, SCREEN_HEIGHT - 120, MISS_COLOR)
             else:
                 alive.append(fruit)
@@ -930,6 +937,7 @@ class FruitNinjaARApp:
                 runner.caught = True
                 caught_now += 1
                 self.caught_pikmin[runner.variant] = self.caught_pikmin.get(runner.variant, 0) + 1
+                self.analytics.record_catch(self.game_time, runner.variant)
                 self._add_feedback(f"Caught {runner.variant}", runner.x, runner.y - 28, GOOD_COLOR)
                 self._burst(runner.x, runner.y, runner.color, amount=7)
             else:
@@ -951,6 +959,7 @@ class FruitNinjaARApp:
                 continue
             offset = self.game_time - fruit.target_time
             result = self.score.register_slice(offset, fever_active=self.fever_timer > 0)
+            self.analytics.record_hit(self.game_time, result.time_offset, result.judgement)
             color = PERFECT_COLOR if result.judgement == "Perfect" else GOOD_COLOR
             self._add_feedback(result.judgement, fruit.x, fruit.y - fruit.radius - 20, color)
             self._shatter_rock(fruit, amount=14)
@@ -1404,26 +1413,42 @@ class FruitNinjaARApp:
 
     def _draw_results_screen(self) -> None:
         draw_dim_overlay(self.screen, 155)
-        panel = pygame.Rect(0, 0, 700, 590)
+        panel = pygame.Rect(0, 0, 980, 590)
         panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
         pygame.draw.rect(self.screen, (18, 25, 35), panel, border_radius=8)
         pygame.draw.rect(self.screen, (255, 255, 255), panel, 2, border_radius=8)
 
+        # ── header (full width) ────────────────────────────────────────────────
         draw_text(self.screen, "Results", self.fonts["title"], TEXT_COLOR, (panel.centerx, panel.y + 46), "center")
         summary = f"{self.player_name or 'Player'}  Grade {self.score.grade()}  Score {self.score.score}  Max Combo {self.score.max_combo}"
-        draw_text(self.screen, summary, self.fonts["medium"], TEXT_COLOR, (panel.centerx, panel.y + 104), "center")
+        draw_text(self.screen, summary, self.fonts["medium"], TEXT_COLOR, (panel.centerx, panel.y + 100), "center")
         if self.new_high:
-            draw_text(self.screen, "New High!", self.fonts["large"], FEVER_COLOR, (panel.centerx, panel.y + 142), "center")
+            draw_text(self.screen, "New High!", self.fonts["large"], FEVER_COLOR, (panel.centerx, panel.y + 138), "center")
 
-        leaderboard_y = panel.y + 190 if self.new_high else panel.y + 154
-        draw_text(self.screen, "Leaderboard", self.fonts["medium"], (205, 216, 228), (panel.x + 82, leaderboard_y))
+        # ── left column: leaderboard ───────────────────────────────────────────
+        leaderboard_y = panel.y + 186 if self.new_high else panel.y + 154
+        draw_text(self.screen, "Leaderboard", self.fonts["medium"], (205, 216, 228), (panel.x + 52, leaderboard_y))
         entries = self.leaderboard_entries[:5]
         if not entries:
-            draw_text(self.screen, "No scores yet", self.fonts["small"], (142, 154, 170), (panel.x + 82, leaderboard_y + 42))
+            draw_text(self.screen, "No scores yet", self.fonts["small"], (142, 154, 170), (panel.x + 52, leaderboard_y + 42))
         for index, entry in enumerate(entries, start=1):
-            line = f"{index}. {entry.name:<16} {entry.score:>6}  {entry.grade}  Combo {entry.max_combo}"
+            line = f"{index}. {entry.name:<14} {entry.score:>6}  {entry.grade}  x{entry.max_combo}"
             color = FEVER_COLOR if entry.name == (self.player_name.strip() or "Player") and entry.score == self.score.score else TEXT_COLOR
-            draw_text(self.screen, line, self.fonts["small"], color, (panel.x + 82, leaderboard_y + 12 + index * 34))
+            draw_text(self.screen, line, self.fonts["small"], color, (panel.x + 52, leaderboard_y + 12 + index * 34))
+
+        # ── right column: radar chart ──────────────────────────────────────────
+        stats = self.analytics.radar_stats(self.score.max_combo)
+        radar_cx = panel.x + 770
+        radar_cy = panel.y + 360
+        draw_radar_chart(
+            self.screen, radar_cx, radar_cy, 140, stats,
+            self.fonts["small"],
+        )
+        draw_text(
+            self.screen, "Player Profile",
+            self.fonts["medium"], (205, 216, 228),
+            (radar_cx, panel.y + 168), "center",
+        )
 
         for button in self.buttons:
             self._draw_button(button)
