@@ -4,11 +4,22 @@ A Python desktop AR game for a machine learning project. The game uses `assets/b
 
 ## Setup
 
+### macOS / Linux
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 python3 main.py
+```
+
+### Windows (PowerShell)
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python main.py
 ```
 
 On macOS, allow camera access for your terminal app or IDE in **System Settings > Privacy & Security > Camera**. The game will not start unless the camera and hand tracker detect your hand during the hand-check stage.
@@ -66,10 +77,6 @@ curl -L -o assets/models/hand_landmarker.task \
 ```
 
 If MediaPipe cannot initialize on the current Python/macOS combination, the game uses an OpenCV camera-based color hand tracker. It still requires an actual hand in the webcam frame; there is no mouse gameplay fallback.
-
-### Windows Username Path Issue
-
-On Windows, if your user folder contains non-ASCII characters (such as Chinese), MediaPipe's C++ core may fail to open the model file path directly, which causes the game to silently fall back to the color camera tracker. The game handles this by loading the model into memory (`model_asset_buffer`) instead of passing the path string, and by using `RunningMode.VIDEO`. This ensures stable hand tracking across both Windows and macOS platforms without breaking.
 
 ## Controls
 
