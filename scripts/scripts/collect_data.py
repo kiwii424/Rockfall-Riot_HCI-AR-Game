@@ -1,62 +1,81 @@
-import cv2
+from pathlib import Path
 import csv
 import os
-from game.gestures import HandTracker
-from game.camera import CameraFeed
+import sys
 
-def collect():
+import cv2
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from game.camera import CameraFeed
+from game.gestures import HandTracker
+
+
+DATA_DIR = PROJECT_ROOT / "data"
+CSV_PATH = DATA_DIR / "gesture_data.csv"
+
+
+def collect() -> None:
     tracker = HandTracker()
     camera = CameraFeed(640, 480)
-    
-    # 建立 CSV 檔案
-    csv_path = "data/gesture_data.csv"
-    os.makedirs("data", exist_ok=True)
-    
-    print("開始採集！請對著鏡頭比手勢，確認畫面為選取狀態後按鍵盤數字鍵錄製：")
-    print("0: 切 (Sword), 1: 抓 (Fist), 2: 停 (Stop), 3: 加速, 4: 技能")
 
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.writer(f)
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    print("Press 0-4 to save the current hand pose. Press Esc to quit.")
+    print("0: Sword, 1: Fist, 2: Stop, 3: Speed Up, 4: Skill")
+
+    with open(CSV_PATH, "a", newline="") as file:
+        writer = csv.writer(file)
         running = True
+
         while running:
             rgb = camera.read_rgb()
-            if rgb is None: continue
-            
+            if rgb is None:
+                continue
+
             gesture = tracker.process(rgb, (640, 480))
-            
-            # 顯示畫面方便預覽
-            cv2.imshow("Data Collection (Press Esc to quit)", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+            cv2.imshow(
+                "Data Collection (Press Esc to quit)",
+                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            )
             key = cv2.waitKey(1) & 0xFF
-            if key == 27: 
+            if key == 27:
                 running = False
-            
+
             if gesture.tracking_points:
                 label = None
-                if key == ord('0'): label = 0
-                elif key == ord('1'): label = 1
-                elif key == ord('2'): label = 2
-                elif key == ord('3'): label = 3
-                elif key == ord('4'): label = 4
-                
+                if key == ord("0"):
+                    label = 0
+                elif key == ord("1"):
+                    label = 1
+                elif key == ord("2"):
+                    label = 2
+                elif key == ord("3"):
+                    label = 3
+                elif key == ord("4"):
+                    label = 4
+
                 if label is not None:
-                    # 儲存標籤 + 21 個點的 (x, y) 座標
-                    # 建議存相對座標：所有點減去手腕(第0點)
                     wrist = gesture.tracking_points[0]
                     features = []
-                    for pt in gesture.tracking_points:
-                        features.extend([pt[0] - wrist[0], pt[1] - wrist[1]])
-                    
-                    # 正規化 (Normalization) - 消除手部距離鏡頭遠近的影響
-                    max_val = max(abs(f) for f in features) if features else 1.0
-                    if max_val == 0: max_val = 1.0
-                    features = [f / max_val for f in features]
-                    
-                    row = [label] + features
-                    writer.writerow(row)
-                    print(f"已記錄標籤 {label}        ", end="\r")
+                    for point in gesture.tracking_points:
+                        features.extend([point[0] - wrist[0], point[1] - wrist[1]])
+
+                    max_val = max(abs(value) for value in features) if features else 1.0
+                    if max_val == 0:
+                        max_val = 1.0
+                    features = [value / max_val for value in features]
+
+                    writer.writerow([label] + features)
+                    print(f"Saved label {label}        ", end="\r")
 
     camera.close()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     collect()
