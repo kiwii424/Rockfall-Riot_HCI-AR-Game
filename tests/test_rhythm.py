@@ -37,7 +37,8 @@ class RhythmTests(unittest.TestCase):
         spawner = RhythmSpawner((event,), lead_time=4.0, speed_multiplier=0.15, seed=1)
         rocks, _ = spawner.due_rocks(game_time=-2.0, width=800, height=600, next_rock_id=0)
         self.assertEqual(len(rocks), 1)
-        self.assertAlmostEqual(rocks[0].gravity_scale, 0.15)
+        # ROCK_BEAT_SPEED_MIN=0.82, strength=0.5 → scale=1.07 → 0.15*1.07=0.1605
+        self.assertAlmostEqual(rocks[0].gravity_scale, 0.1605, places=4)
 
 
 if __name__ == "__main__":

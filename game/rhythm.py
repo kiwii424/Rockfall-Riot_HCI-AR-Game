@@ -59,6 +59,14 @@ def default_analysis() -> MusicAnalysis:
     )
 
 
+def _music_start_time(y, sr) -> float:
+    """Return timestamp where audio content begins (skip leading silence)."""
+    import librosa
+    _, trim_indices = librosa.effects.trim(y, top_db=28)
+    start_sample = int(trim_indices[0])
+    return float(start_sample / sr) if start_sample > 0 else 0.0
+
+
 def _onset_strengths(y, sr, beat_times) -> list[float]:
     """Map beat timestamps to normalised onset-envelope strengths."""
     import librosa
@@ -101,6 +109,43 @@ def _normalize_strengths(values: list[float]) -> list[float]:
     return [float(0.25 + value * 0.75) for value in scaled]
 
 
+def _meter_strengths(
+    beat_times: list[float],
+    downbeat_times: list[float],
+    onset_strengths: list[float],
+) -> list[float]:
+    """
+    Merge meter position with onset strength.
+
+    Downbeats → strength clamped to [0.85, 1.0] (guarantees 2 rocks).
+    Other beats → onset strength kept in [0.25, 0.75] (guarantees 1 rock).
+
+    Fallback: if downbeat_times is empty, treat every 4th beat (0, 4, 8, ...)
+    as downbeat so the game always has strong beats.
+    First beat is always treated as a downbeat (song entry point).
+    """
+    tol = 0.08  # 80 ms tolerance for downbeat matching
+
+    # Fallback: no model downbeats → index-based
+    if not downbeat_times and beat_times:
+        downbeat_times = [beat_times[i] for i in range(0, len(beat_times), 4)]
+
+    # First beat = song entry point → always downbeat
+    entry_time = beat_times[0] if beat_times else None
+
+    result: list[float] = []
+    for t, s in zip(beat_times, onset_strengths):
+        is_downbeat = (
+            (entry_time is not None and abs(t - entry_time) < 1e-6)
+            or any(abs(t - db) <= tol for db in downbeat_times)
+        )
+        if is_downbeat:
+            result.append(max(0.85, min(1.0, s)))
+        else:
+            result.append(min(0.75, s))
+    return result
+
+
 def _numpy_compat_shim() -> None:
     """
     Restore deprecated numpy scalar aliases removed in NumPy 1.24.
@@ -139,14 +184,22 @@ def _analyze_with_tcn(path: str) -> tuple[tuple[BeatEvent, ...], float] | None:
         from beat_tracking_tcn.beat_tracker import beatTracker
 
         # beatTracker returns (beat_times, downbeat_times) in seconds
-        beat_times_arr, _ = beatTracker(path, downbeats=True)
+        beat_times_arr, downbeat_times_arr = beatTracker(path, downbeats=True)
         beat_times: list[float] = list(beat_times_arr)
+        downbeat_times: list[float] = list(downbeat_times_arr)
 
         if not beat_times:
             return None
 
         y, sr = librosa.load(path, sr=None, mono=True)
-        strengths = _onset_strengths(y, sr, beat_times)
+        music_start = _music_start_time(y, sr)
+        beat_times = [t for t in beat_times if t >= music_start]
+        downbeat_times = [t for t in downbeat_times if t >= music_start]
+        if not beat_times:
+            return None
+
+        onset_s = _onset_strengths(y, sr, beat_times)
+        strengths = _meter_strengths(beat_times, downbeat_times, onset_s)
 
         ibi = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 60.0 / DEFAULT_BPM
         tempo = 60.0 / ibi if ibi > 0 else float(DEFAULT_BPM)
@@ -154,7 +207,6 @@ def _analyze_with_tcn(path: str) -> tuple[tuple[BeatEvent, ...], float] | None:
         events = tuple(
             BeatEvent(timestamp=t, strength=s, index=i)
             for i, (t, s) in enumerate(zip(beat_times, strengths))
-            if t >= 0.25
         )
         return events, tempo
 
@@ -178,19 +230,33 @@ def _analyze_with_madmom(path: str) -> tuple[tuple[BeatEvent, ...], float] | Non
         _numpy_compat_shim()
 
         from madmom.features.beats import DBNBeatTrackingProcessor, RNNBeatProcessor
+        from madmom.features.downbeats import DBNDownBeatTrackingProcessor, RNNDownBeatProcessor
 
-        # RNN activation function: probability of beat at each 10ms frame
-        act = RNNBeatProcessor()(path)
-
-        # DBN decodes activations into beat timestamps (seconds)
-        proc = DBNBeatTrackingProcessor(fps=100)
-        beat_times: list[float] = list(proc(act))
+        # Try downbeat-aware tracking first (returns [[time, beat_pos], ...])
+        try:
+            db_act = RNNDownBeatProcessor()(path)
+            db_proc = DBNDownBeatTrackingProcessor(beats_per_bar=[3, 4], fps=100)
+            db_result = db_proc(db_act)
+            beat_times = [float(row[0]) for row in db_result]
+            downbeat_times = [float(row[0]) for row in db_result if int(row[1]) == 1]
+        except Exception:
+            # Fallback: plain beat tracking, estimate downbeats from meter
+            act = RNNBeatProcessor()(path)
+            beat_times = list(DBNBeatTrackingProcessor(fps=100)(act))
+            downbeat_times = [t for i, t in enumerate(beat_times) if i % 4 == 0]
 
         if not beat_times:
             return None
 
         y, sr = librosa.load(path, sr=None, mono=True)
-        strengths = _onset_strengths(y, sr, beat_times)
+        music_start = _music_start_time(y, sr)
+        beat_times = [t for t in beat_times if t >= music_start]
+        downbeat_times = [t for t in downbeat_times if t >= music_start]
+        if not beat_times:
+            return None
+
+        onset_s = _onset_strengths(y, sr, beat_times)
+        strengths = _meter_strengths(beat_times, downbeat_times, onset_s)
 
         # Estimate tempo from median inter-beat interval
         ibi = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 60.0 / DEFAULT_BPM
@@ -199,7 +265,6 @@ def _analyze_with_madmom(path: str) -> tuple[tuple[BeatEvent, ...], float] | Non
         events = tuple(
             BeatEvent(timestamp=t, strength=s, index=i)
             for i, (t, s) in enumerate(zip(beat_times, strengths))
-            if t >= 0.25
         )
         return events, tempo
 
@@ -232,17 +297,23 @@ def _analyze_with_librosa(path: str) -> tuple[tuple[BeatEvent, ...], float, floa
         if len(times) == 0:
             return None
 
-        frame_strengths = onset_env[beat_frames]
-        normalized_strengths = _normalize_strengths([float(value) for value in frame_strengths])
+        music_start = _music_start_time(y, sr)
+        # Filter silence and re-index
+        valid = [(i, float(t)) for i, t in enumerate(times) if float(t) >= music_start]
+        if not valid:
+            return None
+        orig_indices, beat_times_list = zip(*valid)
+        beat_times_list = list(beat_times_list)
+        valid_frames = beat_frames[[i for i in orig_indices]]
+
+        frame_strengths = onset_env[valid_frames]
+        onset_s = _normalize_strengths([float(v) for v in frame_strengths])
+        downbeat_times = [t for i, t in enumerate(beat_times_list) if i % 4 == 0]
+        strengths = _meter_strengths(beat_times_list, downbeat_times, onset_s)
 
         events = tuple(
-            BeatEvent(
-                timestamp=float(t),
-                strength=normalized_strengths[i],
-                index=i,
-            )
-            for i, t in enumerate(times)
-            if 0.25 <= float(t) <= duration + 0.1
+            BeatEvent(timestamp=t, strength=s, index=i)
+            for i, (t, s) in enumerate(zip(beat_times_list, strengths))
         )
         return events, tempo_value, duration
 
@@ -364,7 +435,7 @@ class RhythmSpawner:
         height: int,
         next_rock_id: int,
     ) -> list[Rock]:
-        count = 2 if event.strength >= 0.84 and event.index % 4 == 0 else 1
+        count = 2 if event.strength >= 0.84 else 1
         event_speed_multiplier = self._event_speed_multiplier(event)
         rocks: list[Rock] = []
         for offset in range(count):

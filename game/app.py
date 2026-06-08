@@ -219,6 +219,8 @@ class RockfallRiotHCIARGame:
         self.was_fist = False
         self.fever_timer = 0.0
         self.fever_cooldown = 0.0
+        self.beat_pulse = 0.0
+        self._beat_pulse_index = 0
         self.status_message = ""
         self.status_timer = 0.0
         self.rng = random.Random()
@@ -491,6 +493,8 @@ class RockfallRiotHCIARGame:
         self.caught_pikmin = {str(item["name"]): 0 for item in PIKMIN_VARIANTS}
         self.fever_timer = 0.0
         self.fever_cooldown = 0.0
+        self.beat_pulse = 0.0
+        self._beat_pulse_index = 0
         self.results_saved = False
         self.new_high = False
         self.confetti.clear()
@@ -780,6 +784,8 @@ class RockfallRiotHCIARGame:
                 self.fever_cooldown = FEVER_COOLDOWN
         elif self.fever_cooldown > 0:
             self.fever_cooldown = max(0.0, self.fever_cooldown - dt)
+        self.beat_pulse = max(0.0, self.beat_pulse - dt / 0.12)
+        self._check_beat_pulse()
 
     def _update_saber(self, dt: float, gesture: GestureState, allow_new_points: bool) -> None:
         self.saber_points = [(point, ttl - dt) for point, ttl in self.saber_points if ttl - dt > 0]
@@ -905,6 +911,15 @@ class RockfallRiotHCIARGame:
         self.sfx.play_hit()
         self._burst(caught_runner.x, caught_runner.y, caught_runner.color, amount=9)
         self._add_feedback("Catch OK", caught_runner.x, caught_runner.y - 48, GOOD_COLOR)
+
+    def _check_beat_pulse(self) -> None:
+        events = self.analysis.events
+        while self._beat_pulse_index < len(events):
+            event = events[self._beat_pulse_index]
+            if event.timestamp > self.game_time:
+                break
+            self.beat_pulse = 0.35 + event.strength * 0.65
+            self._beat_pulse_index += 1
 
     def _handle_fever_gesture(self, gesture: GestureState) -> None:
         open_palm = gesture.mode == "OPEN_PALM"
@@ -1194,6 +1209,8 @@ class RockfallRiotHCIARGame:
         self._draw_playfield(gesture)
 
         if self.mode in {"PLAYING", "PAUSED", "RESULTS"}:
+            current_beat_idx = self._beat_pulse_index - 1
+            current_ev = self.analysis.events[current_beat_idx] if 0 <= current_beat_idx < len(self.analysis.events) else None
             draw_hud(
                 self.screen,
                 self.fonts,
@@ -1203,6 +1220,9 @@ class RockfallRiotHCIARGame:
                 self.fever_timer,
                 self.fever_cooldown,
                 f"{self.analysis.title} / {self.current_difficulty['label']}",
+                beat_index=current_ev.index if current_ev else -1,
+                beat_strength=current_ev.strength if current_ev else 0.0,
+                beat_pulse=self.beat_pulse,
             )
             for button in self.buttons if self.mode == "PLAYING" else []:
                 self._draw_button(button)
@@ -1238,6 +1258,12 @@ class RockfallRiotHCIARGame:
     def _draw_playfield(self, gesture: GestureState) -> None:
         self._draw_tracking_safe_area()
         hit_y = int(SCREEN_HEIGHT * HIT_LINE_Y_RATIO)
+        if self.beat_pulse > 0 and self.mode == "PLAYING":
+            alpha = int(self.beat_pulse * 210)
+            pulse_color = FEVER_COLOR if self.fever_timer > 0 else ACCENT_COLOR
+            pulse_surf = pygame.Surface((SCREEN_WIDTH, 6), pygame.SRCALPHA)
+            pulse_surf.fill((*pulse_color, alpha))
+            self.screen.blit(pulse_surf, (0, hit_y - 2))
         pygame.draw.line(self.screen, (255, 255, 255, 48), (0, hit_y), (SCREEN_WIDTH, hit_y), 2)
 
         for rock in self.rocks:
