@@ -521,13 +521,31 @@ def analyze_music(path: str, backend: str | None = None) -> MusicAnalysis:
 
     def _make(events, tempo, backend_name):
         final_events = _apply_sidecar(events, sidecar_times) if sidecar_times else events
+        # Half-time thinning: fast music (>150 BPM) has beats too dense to play.
+        # Keep all strong beats; drop every other weak beat → effective ~75 BPM floor.
+        if tempo > 150:
+            kept: list[BeatEvent] = []
+            weak_counter = 0
+            for ev in final_events:
+                if ev.strength >= 0.84:
+                    kept.append(ev)
+                else:
+                    if weak_counter % 2 == 0:
+                        kept.append(ev)
+                    weak_counter += 1
+            final_events = tuple(
+                BeatEvent(timestamp=ev.timestamp, strength=ev.strength, index=i)
+                for i, ev in enumerate(kept)
+            )
+        suffix = "+sidecar" if sidecar_times else ""
+        suffix += "+halftime" if tempo > 150 else ""
         return MusicAnalysis(
             path=str(music_path),
             title=music_path.stem,
             duration=duration,
             tempo=tempo,
             events=final_events,
-            backend=backend_name + ("+sidecar" if sidecar_times else ""),
+            backend=backend_name + suffix,
         )
 
     b = (backend or "").lower()
@@ -669,7 +687,9 @@ class RhythmSpawner:
         return max(0.05, self.speed_multiplier * beat_speed_scale)
 
     def _lane_x(self, width: int, index: int) -> float:
-        lane_count = 7
+        lane_count = 5
         lane = index % lane_count
-        lane_width = width / (lane_count + 1)
-        return lane_width * (lane + 1) + self._rng.uniform(-34, 34)
+        usable_start = width * 0.18
+        usable_end   = width * 0.82
+        lane_width = (usable_end - usable_start) / (lane_count + 1)
+        return usable_start + lane_width * (lane + 1) + self._rng.uniform(-24, 24)
