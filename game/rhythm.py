@@ -67,6 +67,119 @@ def _music_start_time(y, sr) -> float:
     return float(start_sample / sr) if start_sample > 0 else 0.0
 
 
+def _music_end_time(y, sr) -> float:
+    """Return timestamp where audio content ends (skip trailing silence)."""
+    import librosa
+    _, trim_indices = librosa.effects.trim(y, top_db=28)
+    end_sample = int(trim_indices[1])
+    total = len(y)
+    return float(end_sample / sr) if end_sample < total else float(total / sr)
+
+
+def _snap_to_grid(beat_times: list[float], true_ibi: float) -> list[float]:
+    """
+    Select TCN beats that align with a regular grid spaced true_ibi apart.
+    Builds grid from beat_times[0], advances one true_ibi at a time,
+    snaps each grid position to the nearest TCN beat (within true_ibi/2).
+    Removes duplicates while preserving TCN's timing precision.
+    """
+    if not beat_times or true_ibi <= 0:
+        return beat_times
+    t = beat_times[0]
+    t_end = beat_times[-1]
+    result: list[float] = []
+    seen: set[float] = set()
+    while t <= t_end + true_ibi * 0.5:
+        closest = min(beat_times, key=lambda bt: abs(bt - t))
+        if abs(closest - t) <= true_ibi * 0.5 and closest not in seen:
+            result.append(closest)
+            seen.add(closest)
+            t = closest  # follow actual timing
+        t += true_ibi
+    return result
+
+
+def _thin_double_tempo(
+    beat_times: list[float],
+    onset_strengths: list[float],
+    beats_per_bar: int,
+) -> tuple[list[float], list[float], int]:
+    """
+    When TCN runs at 2x tempo (beats_per_bar 6 or 8), halve the beat list.
+    Try both even/odd alternations; keep whichever has higher total onset energy.
+    """
+    if beats_per_bar not in (6, 8) or len(beat_times) < 2:
+        return beat_times, onset_strengths, beats_per_bar
+
+    even = list(zip(beat_times[::2], onset_strengths[::2]))
+    odd  = list(zip(beat_times[1::2], onset_strengths[1::2]))
+    score_even = sum(s for _, s in even)
+    score_odd  = sum(s for _, s in odd)
+    chosen = even if score_even >= score_odd else odd
+    t_out, s_out = zip(*chosen) if chosen else ([], [])
+    return list(t_out), list(s_out), beats_per_bar // 2
+
+
+def _infer_downbeats(
+    beat_times: list[float],
+    tcn_downbeats: list[float],
+    onset_strengths: list[float],
+    ibi: float,
+) -> list[float]:
+    """
+    Infer downbeat positions by brute-forcing all phase offsets and picking the
+    phase whose inferred downbeats have the highest total onset energy.
+
+    TCN downbeats are only used to determine beats_per_bar (3/4 or 4/4,
+    plus double-tempo variants 6/8); their exact positions are NOT trusted.
+    """
+    import numpy as np
+
+    if not beat_times or ibi <= 0:
+        return []
+
+    strength_map = dict(zip(beat_times, onset_strengths))
+
+    # --- 1. Determine beats_per_bar from TCN downbeat spacing ---
+    if len(tcn_downbeats) >= 2:
+        db_intervals = [tcn_downbeats[i + 1] - tcn_downbeats[i]
+                        for i in range(len(tcn_downbeats) - 1)]
+        avg_db_interval = float(np.median(db_intervals))
+        candidates = [3, 4]
+        beats_per_bar = min(candidates, key=lambda n: abs(avg_db_interval - n * ibi))
+    else:
+        beats_per_bar = 4
+
+    bar_duration = ibi * beats_per_bar
+    t_start, t_end = beat_times[0], beat_times[-1]
+
+    def _generate(anchor: float) -> list[float]:
+        # Walk backwards to first bar
+        t = anchor
+        while t - bar_duration >= t_start - bar_duration * 0.1:
+            t -= bar_duration
+
+        result, seen = [], set()
+        while t <= t_end + bar_duration * 0.5:
+            if t >= t_start - bar_duration * 0.1:
+                closest = min(beat_times, key=lambda bt: abs(bt - t))
+                if abs(closest - t) <= ibi * 0.5 and closest not in seen:
+                    result.append(closest)
+                    seen.add(closest)
+            t += bar_duration
+        return sorted(result)
+
+    # --- 2. Try each beat in first bar as phase anchor, score by onset energy ---
+    best_score, best_downbeats = -1.0, []
+    for phase_beat in beat_times[:beats_per_bar]:
+        downbeats = _generate(phase_beat)
+        score = sum(strength_map.get(db, 0.0) for db in downbeats)
+        if score > best_score:
+            best_score, best_downbeats = score, downbeats
+
+    return best_downbeats
+
+
 def _onset_strengths(y, sr, beat_times) -> list[float]:
     """Map beat timestamps to normalised onset-envelope strengths."""
     import librosa
@@ -130,15 +243,9 @@ def _meter_strengths(
     if not downbeat_times and beat_times:
         downbeat_times = [beat_times[i] for i in range(0, len(beat_times), 4)]
 
-    # First beat = song entry point → always downbeat
-    entry_time = beat_times[0] if beat_times else None
-
     result: list[float] = []
     for t, s in zip(beat_times, onset_strengths):
-        is_downbeat = (
-            (entry_time is not None and abs(t - entry_time) < 1e-6)
-            or any(abs(t - db) <= tol for db in downbeat_times)
-        )
+        is_downbeat = any(abs(t - db) <= tol for db in downbeat_times)
         if is_downbeat:
             result.append(max(0.85, min(1.0, s)))
         else:
@@ -193,16 +300,42 @@ def _analyze_with_tcn(path: str) -> tuple[tuple[BeatEvent, ...], float] | None:
 
         y, sr = librosa.load(path, sr=None, mono=True)
         music_start = _music_start_time(y, sr)
-        beat_times = [t for t in beat_times if t >= music_start]
-        downbeat_times = [t for t in downbeat_times if t >= music_start]
+        music_end = _music_end_time(y, sr)
+        beat_times = [t for t in beat_times if music_start <= t <= music_end]
+        downbeat_times = [t for t in downbeat_times if music_start <= t <= music_end]
         if not beat_times:
             return None
 
-        onset_s = _onset_strengths(y, sr, beat_times)
-        strengths = _meter_strengths(beat_times, downbeat_times, onset_s)
-
         ibi = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 60.0 / DEFAULT_BPM
-        tempo = 60.0 / ibi if ibi > 0 else float(DEFAULT_BPM)
+
+        # --- Correct double-tempo using librosa tempo as ground truth ---
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        lib_tempo_arr = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+        lib_tempo = float(np.asarray(lib_tempo_arr).reshape(-1)[0])
+        lib_ibi = 60.0 / lib_tempo if lib_tempo > 0 else ibi
+
+        if ibi < lib_ibi * 0.65:
+            # TCN running at ~2x tempo → snap TCN beats to librosa tempo grid
+            beat_times = _snap_to_grid(beat_times, lib_ibi)
+            ibi = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else lib_ibi
+
+        onset_s = _onset_strengths(y, sr, beat_times)
+
+        # Use librosa beat times to anchor downbeats — fixes TCN tempo drift
+        _, lib_beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, units="frames")
+        lib_beat_times = [float(t) for t in librosa.frames_to_time(lib_beat_frames, sr=sr)
+                          if music_start <= float(t) <= music_end]
+        lib_downbeats = [lib_beat_times[i] for i in range(0, len(lib_beat_times), 4)]
+
+        # Snap each librosa downbeat to nearest TCN beat
+        snapped_downbeats = []
+        for ld in lib_downbeats:
+            closest = min(beat_times, key=lambda bt: abs(bt - ld))
+            if abs(closest - ld) <= ibi and closest not in snapped_downbeats:
+                snapped_downbeats.append(closest)
+
+        strengths = _meter_strengths(beat_times, snapped_downbeats, onset_s)
+        tempo = 60.0 / lib_ibi if lib_ibi > 0 else float(DEFAULT_BPM)
 
         events = tuple(
             BeatEvent(timestamp=t, strength=s, index=i)
@@ -250,8 +383,9 @@ def _analyze_with_madmom(path: str) -> tuple[tuple[BeatEvent, ...], float] | Non
 
         y, sr = librosa.load(path, sr=None, mono=True)
         music_start = _music_start_time(y, sr)
-        beat_times = [t for t in beat_times if t >= music_start]
-        downbeat_times = [t for t in downbeat_times if t >= music_start]
+        music_end = _music_end_time(y, sr)
+        beat_times = [t for t in beat_times if music_start <= t <= music_end]
+        downbeat_times = [t for t in downbeat_times if music_start <= t <= music_end]
         if not beat_times:
             return None
 
@@ -298,8 +432,9 @@ def _analyze_with_librosa(path: str) -> tuple[tuple[BeatEvent, ...], float, floa
             return None
 
         music_start = _music_start_time(y, sr)
-        # Filter silence and re-index
-        valid = [(i, float(t)) for i, t in enumerate(times) if float(t) >= music_start]
+        music_end = _music_end_time(y, sr)
+        # Filter leading/trailing silence and re-index
+        valid = [(i, float(t)) for i, t in enumerate(times) if music_start <= float(t) <= music_end]
         if not valid:
             return None
         orig_indices, beat_times_list = zip(*valid)
@@ -321,7 +456,54 @@ def _analyze_with_librosa(path: str) -> tuple[tuple[BeatEvent, ...], float, floa
         return None
 
 
-def analyze_music(path: str) -> MusicAnalysis:
+def _apply_sidecar(events: tuple[BeatEvent, ...], strong_times: list[float]) -> tuple[BeatEvent, ...]:
+    """
+    Use sidecar tap timestamps as phase anchors to extrapolate all strong beats.
+    If >= 2 taps: derive bar_duration from median tap interval, extrapolate full song.
+    If 1 tap: mark only that beat as strong.
+    """
+    import numpy as np
+    if not strong_times or not events:
+        return events
+
+    beat_times = [ev.timestamp for ev in events]
+    tol = 0.15  # 150ms snap
+
+    if len(strong_times) >= 2:
+        st_sorted = sorted(strong_times)
+        intervals = [st_sorted[i+1] - st_sorted[i] for i in range(len(st_sorted)-1)]
+        bar_duration = float(np.median(intervals))
+        anchor = st_sorted[0]
+        t_start, t_end = beat_times[0], beat_times[-1]
+
+        # Walk backwards from anchor
+        t = anchor
+        while t - bar_duration >= t_start - bar_duration * 0.1:
+            t -= bar_duration
+
+        # Generate from theoretical grid and snap each bar independently
+        # Do NOT update t from snapped position — keeps librosa timing, no drift
+        strong_set: set[float] = set()
+        while t <= t_end + bar_duration * 0.5:
+            if t >= t_start - bar_duration * 0.1:
+                closest = min(beat_times, key=lambda bt: abs(bt - t))
+                if abs(closest - t) <= bar_duration * 0.4:
+                    strong_set.add(closest)
+            t += bar_duration
+    else:
+        strong_set = set(strong_times)
+
+    result = []
+    for ev in events:
+        is_strong = any(abs(ev.timestamp - st) <= tol for st in strong_set)
+        if is_strong:
+            result.append(BeatEvent(timestamp=ev.timestamp, strength=max(0.85, ev.strength), index=ev.index))
+        else:
+            result.append(BeatEvent(timestamp=ev.timestamp, strength=min(0.75, ev.strength), index=ev.index))
+    return tuple(result)
+
+
+def analyze_music(path: str, backend: str | None = None) -> MusicAnalysis:
     try:
         import librosa
     except ModuleNotFoundError as exc:
@@ -335,57 +517,66 @@ def analyze_music(path: str) -> MusicAnalysis:
     if duration <= 0:
         raise RuntimeError("music file has no playable duration")
 
-    # --- Primary: real TCN model (Davies & Böck, EUSIPCO 2019) ---
-    tcn_result = _analyze_with_tcn(str(music_path))
-    if tcn_result is not None:
-        events, tempo = tcn_result
-        if events:
-            return MusicAnalysis(
-                path=str(music_path),
-                title=music_path.stem,
-                duration=duration,
-                tempo=tempo,
-                events=events,
-                backend="tcn-dbn",
-            )
+    sidecar_times = _load_sidecar(music_path)
 
-    # --- Secondary: madmom RNN+DBN pipeline (Böck et al., TCN paper baseline) ---
-    madmom_result = _analyze_with_madmom(str(music_path))
-    if madmom_result is not None:
-        events, tempo = madmom_result
-        if events:
-            return MusicAnalysis(
-                path=str(music_path),
-                title=music_path.stem,
-                duration=duration,
-                tempo=tempo,
-                events=events,
-                backend="madmom-dbn",
-            )
+    def _make(events, tempo, backend_name):
+        final_events = _apply_sidecar(events, sidecar_times) if sidecar_times else events
+        return MusicAnalysis(
+            path=str(music_path),
+            title=music_path.stem,
+            duration=duration,
+            tempo=tempo,
+            events=final_events,
+            backend=backend_name + ("+sidecar" if sidecar_times else ""),
+        )
 
-    # --- Fallback: librosa dynamic-programming beat tracker ---
-    librosa_result = _analyze_with_librosa(str(music_path))
-    if librosa_result is not None:
-        events, tempo, _ = librosa_result
-        if events:
-            return MusicAnalysis(
-                path=str(music_path),
-                title=music_path.stem,
-                duration=duration,
-                tempo=tempo,
-                events=events,
-                backend="librosa-dp",
-            )
+    b = (backend or "").lower()
+
+    # --- Primary: librosa dynamic-programming beat tracker ---
+    if b in ("", "librosa"):
+        librosa_result = _analyze_with_librosa(str(music_path))
+        if librosa_result is not None:
+            events, tempo, _ = librosa_result
+            if events:
+                return _make(events, tempo, "librosa-dp")
+        if b == "librosa":
+            raise RuntimeError("librosa backend failed")
+
+    # --- Secondary: real TCN model (Davies & Böck, EUSIPCO 2019) ---
+    if b in ("", "tcn"):
+        tcn_result = _analyze_with_tcn(str(music_path))
+        if tcn_result is not None:
+            events, tempo = tcn_result
+            if events:
+                return _make(events, tempo, "tcn-dbn")
+        if b == "tcn":
+            raise RuntimeError("TCN backend failed or not installed")
+
+    # --- Tertiary: madmom RNN+DBN pipeline ---
+    if b in ("", "madmom"):
+        madmom_result = _analyze_with_madmom(str(music_path))
+        if madmom_result is not None:
+            events, tempo = madmom_result
+            if events:
+                return _make(events, tempo, "madmom-dbn")
+        if b == "madmom":
+            raise RuntimeError("madmom backend failed or not installed")
 
     # --- Last resort: metronome at default BPM ---
-    return MusicAnalysis(
-        path=str(music_path),
-        title=music_path.stem,
-        duration=duration,
-        tempo=float(DEFAULT_BPM),
-        events=default_events(duration=duration, bpm=DEFAULT_BPM),
-        backend="default",
-    )
+    return _make(default_events(duration=duration, bpm=DEFAULT_BPM), float(DEFAULT_BPM), "default")
+
+
+def _load_sidecar(music_path: Path) -> list[float] | None:
+    import json as _json
+    sidecar = music_path.with_suffix(".json")
+    if sidecar.exists():
+        try:
+            data = _json.loads(sidecar.read_text())
+            times = data.get("strong_beats", [])
+            return [float(t) for t in times] if times else None
+        except Exception:
+            return None
+    return None
 
 
 class RhythmSpawner:

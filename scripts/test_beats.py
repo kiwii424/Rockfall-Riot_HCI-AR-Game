@@ -10,6 +10,8 @@ plays the audio, and prints tempo / backend / accuracy info.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -46,12 +48,12 @@ def pick_file(arg: str | None) -> str | None:
         return None
 
 
-def run(path: str) -> None:
+def run(path: str, backend: str | None = None) -> None:
     import pygame
 
     print(f"\nAnalyzing: {path}")
     t0 = time.perf_counter()
-    analysis = analyze_music(path)
+    analysis = analyze_music(path, backend=backend)
     elapsed = time.perf_counter() - t0
 
     strong_beats = [e for e in analysis.events if e.strength >= 0.84]
@@ -69,7 +71,7 @@ def run(path: str) -> None:
     for ev in analysis.events[:20]:
         tag = "STRONG ●" if ev.strength >= 0.84 else "weak   ○"
         print(f"    [{ev.index:3d}] t={ev.timestamp:.3f}s  s={ev.strength:.3f}  {tag}")
-    print("\nControls: Space = pause/resume  |  Esc = quit\n")
+    print("\nControls: Space = pause/resume  |  T = tap strong beat  |  S = save  |  Esc = quit\n")
 
     pygame.init()
     try:
@@ -99,6 +101,21 @@ def run(path: str) -> None:
     game_time = 0.0
     paused = False
     started = False
+    tap_times: list[float] = []   # snapped strong-beat timestamps
+    save_msg_timer = 0.0
+    sidecar_path = Path(path).with_suffix(".json")
+
+    def _snap_tap(t: float) -> float | None:
+        """Snap t to nearest beat within 300ms; return None if no beat nearby."""
+        if not events:
+            return None
+        closest = min(events, key=lambda e: abs(e.timestamp - t))
+        return closest.timestamp if abs(closest.timestamp - t) <= 0.3 else None
+
+    def _save_sidecar() -> None:
+        data = {"strong_beats": sorted(set(tap_times))}
+        sidecar_path.write_text(json.dumps(data, indent=2))
+        print(f"  Saved {len(data['strong_beats'])} strong beats → {sidecar_path}")
 
     def start_playback():
         nonlocal started
@@ -125,9 +142,17 @@ def run(path: str) -> None:
                             pygame.mixer.music.pause()
                         else:
                             pygame.mixer.music.unpause()
+                elif event.key == pygame.K_t:
+                    snapped = _snap_tap(game_time)
+                    if snapped is not None and snapped not in tap_times:
+                        tap_times.append(snapped)
+                elif event.key == pygame.K_s:
+                    _save_sidecar()
+                    save_msg_timer = 2.0
 
         if not paused and started:
             game_time += dt
+        save_msg_timer = max(0.0, save_msg_timer - dt)
 
         # trigger beat flash
         while beat_idx < len(events) and events[beat_idx].timestamp <= game_time:
@@ -178,6 +203,11 @@ def run(path: str) -> None:
             color = (255, 211, 77) if ev.strength >= 0.84 else (120, 140, 160)
             pygame.draw.line(screen, color, (mx, bar_y - 2), (mx, bar_y + bar_h + 2), 1)
 
+        # tap markers (green, above timeline)
+        for t in tap_times:
+            mx = bar_x + int(bar_w * t / max(1.0, analysis.duration))
+            pygame.draw.line(screen, (80, 255, 120), (mx, bar_y - 10), (mx, bar_y + bar_h + 10), 2)
+
         # time / next beat
         next_beat_time = events[beat_idx].timestamp if beat_idx < len(events) else None
         time_str = f"{game_time:.2f}s / {analysis.duration:.1f}s"
@@ -188,23 +218,40 @@ def run(path: str) -> None:
         # header
         header = f"{analysis.title}  |  {analysis.tempo:.1f} BPM  |  {analysis.backend}  |  {len(events)} beats"
         screen.blit(font_small.render(header, True, (205, 216, 228)), (40, 18))
+        tap_info = f"Taps: {len(tap_times)}  [T=tap  S=save]"
+        screen.blit(font_small.render(tap_info, True, (80, 255, 120)), (WIDTH - 220, 18))
         if paused:
             screen.blit(font_med.render("PAUSED", True, (255, 211, 77)), (WIDTH // 2 - 40, 16))
+        if save_msg_timer > 0:
+            screen.blit(font_med.render("SAVED!", True, (80, 255, 120)), (WIDTH // 2 - 36, 48))
 
         pygame.display.flip()
 
-        if game_time > analysis.duration + 1.0:
+        last_beat_time = events[-1].timestamp if events else 0.0
+        if game_time > last_beat_time + 1.0:
             running = False
 
+    if tap_times:
+        _save_sidecar()
     pygame.quit()
 
 
 def main() -> None:
-    path = pick_file(sys.argv[1] if len(sys.argv) > 1 else None)
+    parser = argparse.ArgumentParser(description="Beat analysis visualizer")
+    parser.add_argument("file", nargs="?", help="Audio file path")
+    parser.add_argument(
+        "--backend",
+        choices=["tcn", "madmom", "librosa"],
+        default=None,
+        help="Force specific beat-tracking backend (default: auto)",
+    )
+    args = parser.parse_args()
+
+    path = pick_file(args.file)
     if not path:
         print("No file selected.")
         return
-    run(path)
+    run(path, backend=args.backend)
 
 
 if __name__ == "__main__":
