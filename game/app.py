@@ -67,6 +67,14 @@ from .rhythm import MusicAnalysis, RhythmSpawner, analyze_music, default_analysi
 from .scoring import ScoreKeeper
 from .ui import Button, draw_dim_overlay, draw_gauge, draw_hud, draw_screen_panel, draw_text
 
+# (filename, display name, description shown in music select screen)
+MUSIC_TRACKS: list[tuple[str, str, str]] = [
+    ("1.mp3", "Track 1", ""),
+    ("2.mp3", "Track 2", ""),
+    ("3.mp3", "Track 3", "Default Beat"),
+    ("4.mp3", "Track 4", "Waltz"),
+]
+
 
 @dataclass
 class FloatingText:
@@ -337,7 +345,12 @@ class RockfallRiotHCIARGame:
         elif action == "restart":
             self.begin_calibration()
         elif action == "music":
-            self.select_music(use_dialog=source != "hand")
+            self._set_mode("MUSIC_SELECT")
+        elif action.startswith("music_file:"):
+            fname = action.split(":", 1)[1]
+            fpath = Path("assets/music") / fname
+            if fpath.exists():
+                self._load_music_by_path(str(fpath))
         elif action == "quit":
             self.running = False
         elif action == "results":
@@ -394,6 +407,21 @@ class RockfallRiotHCIARGame:
                 Button(pygame.Rect(center_x - 160, 438, 320, 52), "Restart", "restart"),
                 Button(pygame.Rect(center_x - 160, 502, 320, 52), "Music", "music"),
                 Button(pygame.Rect(center_x - 160, 566, 320, 52), "Quit", "quit"),
+            ]
+        elif self.mode == "MUSIC_SELECT":
+            music_dir = Path("assets/music")
+            panel_x = (SCREEN_WIDTH - 680) // 2
+            panel_y = (SCREEN_HEIGHT - 520) // 2
+            track_buttons = []
+            for i, (fname, name, _desc) in enumerate(MUSIC_TRACKS):
+                if (music_dir / fname).exists():
+                    row_y = panel_y + 136 + i * 68
+                    track_buttons.append(
+                        Button(pygame.Rect(panel_x + 40, row_y, 240, 48), name, f"music_file:{fname}")
+                    )
+            self.buttons = [
+                *track_buttons,
+                Button(pygame.Rect(center_x - 160, panel_y + 434, 320, 50), "Back", "back"),
             ]
         elif self.mode == "GALLERY":
             self.buttons = [
@@ -586,6 +614,19 @@ class RockfallRiotHCIARGame:
             self._set_mode("START")
         if self.mode in {"START", "PAUSED", "RESULTS"}:
             self._build_buttons()
+
+    def _load_music_by_path(self, path: str) -> None:
+        self._draw_loading("Analyzing music")
+        try:
+            self.analysis = analyze_music(path)
+            self._set_status(f"Loaded: {self.analysis.title}", 3.0)
+        except RuntimeError as exc:
+            self.analysis = default_analysis()
+            self._set_status(f"Using default beat: {exc}", 4.0)
+        self.duration = self.analysis.duration
+        if self.audio_ready:
+            pygame.mixer.music.stop()
+        self._set_mode("START")
 
     def _next_local_music(self) -> str | None:
         music_dir = Path("assets/music")
@@ -1229,6 +1270,8 @@ class RockfallRiotHCIARGame:
 
         if self.mode == "START":
             self._draw_start_screen()
+        elif self.mode == "MUSIC_SELECT":
+            self._draw_music_select_screen()
         elif self.mode == "CALIBRATION":
             self._draw_calibration_screen(gesture)
         elif self.mode == "TUTORIAL":
@@ -1313,6 +1356,29 @@ class RockfallRiotHCIARGame:
         ):
             pygame.draw.line(layer, (*FEVER_COLOR, 180), start, end, 4)
         self.screen.blit(layer, (0, 0))
+
+    def _draw_music_select_screen(self) -> None:
+        draw_dim_overlay(self.screen, 145)
+        panel = pygame.Rect(0, 0, 680, 520)
+        panel.center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+        pygame.draw.rect(self.screen, (18, 25, 35), panel, border_radius=8)
+        pygame.draw.rect(self.screen, (255, 255, 255), panel, 2, border_radius=8)
+
+        draw_text(self.screen, "Select Music", self.fonts["title"], TEXT_COLOR, (panel.centerx, panel.y + 46), "center")
+        draw_text(self.screen, "Choose a track to play", self.fonts["small"], (142, 154, 170), (panel.centerx, panel.y + 92), "center")
+
+        music_dir = Path("assets/music")
+        for i, (fname, _name, desc) in enumerate(MUSIC_TRACKS):
+            row_y = panel.y + 136 + i * 68
+            exists = (music_dir / fname).exists()
+            if desc:
+                desc_color = (162, 174, 190) if exists else (80, 90, 105)
+                draw_text(self.screen, desc, self.fonts["small"], desc_color, (panel.x + 300, row_y + 15))
+            if not exists:
+                draw_text(self.screen, "(not found)", self.fonts["small"], (80, 90, 105), (panel.x + 300, row_y + 15))
+
+        for button in self.buttons:
+            self._draw_button(button)
 
     def _draw_start_screen(self) -> None:
         draw_dim_overlay(self.screen, 145)

@@ -108,18 +108,16 @@ def draw_hud(
     gauge_color = FEVER_COLOR if cooldown <= 0 else (128, 137, 148)
     draw_gauge(surface, pygame.Rect(width - 356, 20, 144, 24), score.fever_gauge, gauge_color, gauge_label, fonts["small"])
 
-    clipped_title = title if len(title) <= 28 else title[:25] + "..."
-    draw_text(surface, clipped_title, fonts["small"], MUTED_TEXT_COLOR, (572, 25))
-
     if beat_index >= 0:
         strong = beat_strength >= 0.84
         base_color = FEVER_COLOR if strong else ACCENT_COLOR
         alpha = int(60 + beat_pulse * 120)
         dot_surf = pygame.Surface((14, 14), pygame.SRCALPHA)
         pygame.draw.circle(dot_surf, (*base_color, alpha), (7, 7), 7)
-        surface.blit(dot_surf, (width - 124, 28))
-        label = f"B{beat_index + 1} {'●' if strong else '○'}"
-        draw_text(surface, label, fonts["small"], base_color, (width - 108, 26))
+        cx = width // 2
+        surface.blit(dot_surf, (cx - 52, 29))
+        label = f"B{beat_index + 1}  {'STRONG' if strong else 'beat'}"
+        draw_text(surface, label, fonts["small"], base_color, (cx - 33, 26))
 
 
 def draw_screen_panel(surface, fonts, title: str, subtitle: str, buttons: list[Button]) -> None:
