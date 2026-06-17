@@ -255,18 +255,29 @@ def _meter_strengths(
 
 def _numpy_compat_shim() -> None:
     """
-    Restore deprecated numpy scalar aliases removed in NumPy 1.24.
-    Required for compiled madmom Cython extensions (.pyd) that still
-    reference np.int, np.float, etc. at runtime.
+    Restore deprecated aliases removed in modern NumPy / Python so the
+    madmom-based TCN backend can be imported on Python 3.12 + NumPy >= 1.24.
+
+      - NumPy 1.24 removed np.int, np.float, etc. (madmom Cython .pyd needs them).
+      - Python 3.10 moved collections.MutableSequence etc. to collections.abc
+        (madmom/mido still import them from collections directly).
     """
+    import collections
+    import collections.abc as _abc
     import numpy as np
-    _aliases = {
+
+    _np_aliases = {
         "int": np.int64, "float": np.float64, "bool": np.bool_,
         "complex": np.complex128, "object": object, "str": str,
     }
-    for name, alias in _aliases.items():
+    for name, alias in _np_aliases.items():
         if not hasattr(np, name):
             setattr(np, name, alias)
+
+    for name in ("MutableSequence", "MutableMapping", "Mapping",
+                 "Sequence", "Iterable", "Callable"):
+        if not hasattr(collections, name):
+            setattr(collections, name, getattr(_abc, name))
 
 
 def _analyze_with_tcn(path: str) -> tuple[tuple[BeatEvent, ...], float] | None:
@@ -548,20 +559,16 @@ def analyze_music(path: str, backend: str | None = None) -> MusicAnalysis:
             backend=backend_name + suffix,
         )
 
-    b = (backend or "").lower()
+    # Backend resolution. None → env var ARFN_BEAT_BACKEND → "auto".
+    # In "auto" mode we prefer the pre-trained TCN+DBN tracker and fall back
+    # to madmom, then librosa, then a metronome — each step degrades gracefully
+    # so a machine without torch/madmom still plays (on librosa or default).
+    import os
+    b = (backend or os.environ.get("ARFN_BEAT_BACKEND", "auto") or "auto").lower()
+    auto = b in ("", "auto")
 
-    # --- Primary: librosa dynamic-programming beat tracker ---
-    if b in ("", "librosa"):
-        librosa_result = _analyze_with_librosa(str(music_path))
-        if librosa_result is not None:
-            events, tempo, _ = librosa_result
-            if events:
-                return _make(events, tempo, "librosa-dp")
-        if b == "librosa":
-            raise RuntimeError("librosa backend failed")
-
-    # --- Secondary: real TCN model (Davies & Böck, EUSIPCO 2019) ---
-    if b in ("", "tcn"):
+    # --- TCN+DBN (pre-trained, Davies & Böck EUSIPCO 2019 / ben-hayes) ---
+    if auto or b == "tcn":
         tcn_result = _analyze_with_tcn(str(music_path))
         if tcn_result is not None:
             events, tempo = tcn_result
@@ -570,8 +577,8 @@ def analyze_music(path: str, backend: str | None = None) -> MusicAnalysis:
         if b == "tcn":
             raise RuntimeError("TCN backend failed or not installed")
 
-    # --- Tertiary: madmom RNN+DBN pipeline ---
-    if b in ("", "madmom"):
+    # --- madmom RNN+DBN pipeline ---
+    if auto or b == "madmom":
         madmom_result = _analyze_with_madmom(str(music_path))
         if madmom_result is not None:
             events, tempo = madmom_result
@@ -579,6 +586,16 @@ def analyze_music(path: str, backend: str | None = None) -> MusicAnalysis:
                 return _make(events, tempo, "madmom-dbn")
         if b == "madmom":
             raise RuntimeError("madmom backend failed or not installed")
+
+    # --- librosa dynamic-programming beat tracker (Ellis 2007) ---
+    if auto or b == "librosa":
+        librosa_result = _analyze_with_librosa(str(music_path))
+        if librosa_result is not None:
+            events, tempo, _ = librosa_result
+            if events:
+                return _make(events, tempo, "librosa-dp")
+        if b == "librosa":
+            raise RuntimeError("librosa backend failed")
 
     # --- Last resort: metronome at default BPM ---
     return _make(default_events(duration=duration, bpm=DEFAULT_BPM), float(DEFAULT_BPM), "default")

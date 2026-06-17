@@ -6,3 +6,5 @@ numpy>=1.23
 soundfile>=0.12
 madmom>=0.16
 torch>=2.0
+# TCN beat-tracking backend (incomplete on PyPI; run scripts/setup_tcn.py after install)
+beat_tracking_tcn @ git+https://github.com/ben-hayes/beat-tracking-tcn.git

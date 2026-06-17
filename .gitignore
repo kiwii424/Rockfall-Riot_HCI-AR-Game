@@ -11,9 +11,17 @@ venv-1/
 .claude
 
 # Local music can be large and is usually user-provided.
-assets/music/*
 !assets/music/.gitkeep
+# Synthetic test tones (regenerable) and large/copyrighted tracks.
+assets/music/*.wav
+assets/music/1_GGteens.mp3
 assets/models/*.task
 !assets/models/.gitkeep
 data/leaderboard.json
 data/crash.log
+
+# Presentation/report build artifacts (node_modules etc.)
+.pptx_build/
+
+# Stray temp clones
+Users*AppData*Temp*/
